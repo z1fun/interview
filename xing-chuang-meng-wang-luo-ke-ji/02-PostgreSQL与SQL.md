@@ -55,6 +55,56 @@ ORDER BY day, rn;
 
 不要看到 Seq Scan 就认定有问题，大比例读取时顺序扫描可能更便宜；也不要只看一次缓存命中后的最快结果。
 
+### 实操：如何检查连接池排队与锁等待
+
+两处等待不同：**连接池排队发生在应用拿连接时；锁等待发生在 SQL 已到数据库之后。** 以下按 Go `database/sql` + PostgreSQL，排障时按需阅读。
+
+**第一步：在 Go 服务中看连接池指标。** `db` 是业务实际使用的 `*sql.DB`，不要新建一个池来检查。
+
+```go
+s := db.Stats()
+log.Printf("max=%d open=%d inUse=%d idle=%d waits=%d waitTime=%s",
+    s.MaxOpenConnections, s.OpenConnections, s.InUse, s.Idle,
+    s.WaitCount, s.WaitDuration)
+```
+
+在问题发生期间每隔几秒采样：当 `InUse` 持续达到非零上限、`Idle=0`，且 `WaitCount/WaitDuration` 持续增加，就有连接池排队证据。后两者是累计值，要看采样差值；`WaitCount` 不是当前排队人数。[Go DBStats](https://pkg.go.dev/database/sql#DBStats)
+
+检查 Rows 是否及时 Close、事务是否 Commit/Rollback、是否有慢 SQL/长事务长期占用连接。先修复占用原因，再结合数据库容量调整池大小。若使用原生 pgxpool，应查看该池的 Stat；若中间还有 PgBouncer，也要查代理池。
+
+**第二步：在 psql 或数据库客户端查询当前会话。** 应在卡顿期间执行，使用能查看目标会话的监控账号。
+
+```sql
+SELECT pid, application_name, state,
+       wait_event_type, wait_event,
+       clock_timestamp() - query_start AS query_age,
+       clock_timestamp() - xact_start AS transaction_age,
+       pg_blocking_pids(pid) AS blocking_pids,
+       LEFT(query, 200) AS query
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND pid <> pg_backend_pid()
+  AND state <> 'idle'
+ORDER BY query_start;
+```
+
+`wait_event_type='Lock'` 表示当前等待锁；`state='active'` 也可能在等待。`idle in transaction` 表示事务未结束、当前等待客户端，可能持锁。`query_age` 是语句开始以来的时间，不是锁等待时长；非 active 会话的 query 是上一条语句。[会话状态说明](https://www.postgresql.org/docs/current/monitoring-stats.html)
+
+**第三步：找到谁阻塞了它。** 如 blocking_pids 返回 `{12345}`：
+
+```sql
+SELECT pid, application_name, usename, state,
+       xact_start, wait_event_type, wait_event, query
+FROM pg_stat_activity
+WHERE pid = 12345; -- 替换为实际阻塞者 PID
+```
+
+`pg_blocking_pids` 返回阻塞该会话获取锁的进程 ID。[函数说明](https://www.postgresql.org/docs/current/functions-info.html)
+
+结合 application_name 和应用日志定位事务，检查是否更新后未提交、事务中等待外部接口，或 DDL 与业务冲突。优先让所属业务正常结束事务，再修复事务范围；不要根据一张截图直接终止会话。
+
+**判断边界**：一次采样没有锁等待，不代表之前没等过；池指标也只覆盖当前进程的当前池。应结合故障时间连续采样。锁等待可能长期占住连接，继而导致连接池排队，两者可以同时发生。
+
 ## 4. 索引、预聚合与分页
 
 常用“租户等值 + 支付时间范围”时，候选索引为 `(tenant_id, paid_at)`。如果渠道等值筛选也很常见，再评估 `(tenant_id, channel_id, paid_at)`。选择要结合真实查询，索引也增加写入与存储成本。
